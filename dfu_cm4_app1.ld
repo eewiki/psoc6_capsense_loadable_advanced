@@ -56,7 +56,7 @@ MEMORY
          
     flash_cm0p  (rx)  : ORIGIN = 0x10000000, LENGTH = 0x2000     
     flash_app0  (rx)  : ORIGIN = 0x10002000, LENGTH = 0x4E000
-    flash_app1  (rx)  : ORIGIN = 0x10050000, LENGTH = 0x10000
+    flash_app1  (rx)  : ORIGIN = 0x10050000, LENGTH = 0x35000
 
     flash_boot_meta   (rw)  : ORIGIN = 0x100FFB00, LENGTH = 0x400
 

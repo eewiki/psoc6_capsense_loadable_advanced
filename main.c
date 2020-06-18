@@ -49,6 +49,9 @@
 #include "cycfg.h"
 #include "cycfg_capsense.h"
 #include "led.h"
+#include "cycfg_ble.h"
+#include "cy_dfu.h"
+
 
 /*******************************************************************************
 * Macros
@@ -67,6 +70,8 @@ static void capsense_isr(void);
 static void capsense_callback();
 static void handle_ezi2c_tuner_event(void *callback_arg, cyhal_ezi2c_status_t event);
 void handle_error(void);
+void IasEventHandler(uint32 event, void *eventParam);
+void AppCallBack(uint32_t event, void* eventParam);
 
 /*******************************************************************************
 * Global Variables
@@ -76,6 +81,20 @@ cyhal_ezi2c_t sEzI2C;
 cyhal_ezi2c_slave_cfg_t sEzI2C_sub_cfg;
 cyhal_ezi2c_cfg_t sEzI2C_cfg;
 bool capsense_scan_complete = false;
+
+volatile uint8_t alertLevel;
+cy_stc_ble_conn_handle_t appConnHandle;
+
+/* BLESS interrupt configure structure (for single CPU mode) */
+static cy_stc_sysint_t blessIsrCfg =
+{
+	/* The BLESS interrupt */
+	.intrSrc = (IRQn_Type)bless_interrupt_IRQn,
+
+	/* The interrupt priority number */
+	.intrPriority = 1u
+};
+
 
 /*******************************************************************************
 * Function Name: handle_error
@@ -97,6 +116,20 @@ void handle_error(void)
 
     CY_ASSERT(0);
 }
+
+
+/*******************************************************************************
+* Function:     BlessInterrupt
+* Author:       Cypress Semiconductor
+* Description:    It is used used when BLE middleware operates in BLE single CM4
+* Date:
+*******************************************************************************/
+void BlessInterrupt(void)
+{
+    /* Call interrupt processing */
+    Cy_BLE_BlessIsrHandler();
+}
+
 
 /*******************************************************************************
 * Function Name: main
@@ -142,6 +175,28 @@ int main(void)
         CY_ASSERT(0);
     }
 
+    /* Hook interrupt service routines for BLESS */
+    (void) Cy_SysInt_Init(&blessIsrCfg, &BlessInterrupt);
+
+    /* Store pointer to blessIsrCfg in BLE configuration structure */
+    cy_ble_config.hw->blessIsrConfig = &blessIsrCfg;
+
+    /* Start BLE component and register generic event handler */
+    /* Register the generic event handler */
+    Cy_BLE_RegisterEventCallback(&AppCallBack);
+
+    /* Initialize the BLE host */
+    (void)Cy_BLE_Init(&cy_ble_config);
+
+    /* Enable BLE Low Power Mode (LPM)*/
+    Cy_BLE_EnableLowPowerMode();
+
+    /* Enable BLE */
+    (void)Cy_BLE_Enable();
+
+    /* Register the IAS CallBack */
+    Cy_BLE_IAS_RegisterAttrCallback(IasEventHandler);
+
     /* Initiate first scan */
     Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
 
@@ -167,6 +222,15 @@ int main(void)
         {
             /* Initiate next scan */
             Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
+        }
+
+        Cy_BLE_ProcessEvents();
+
+        /* If alert level written */
+        if (alertLevel != 0)
+        {
+            /* Switch to bootloader (app0) */
+            Cy_DFU_ExecuteApp(0u);
         }
     }
 }
@@ -396,6 +460,144 @@ static void initialize_capsense_tuner(void)
     cyhal_ezi2c_enable_event(&sEzI2C,
                              (CYHAL_EZI2C_STATUS_ERR | CYHAL_EZI2C_STATUS_WRITE1 | CYHAL_EZI2C_STATUS_READ1),
                              EZI2C_INTR_PRIORITY, true);
+}
+
+
+/*******************************************************************************
+* Function:     IasEventHandler
+* Author:       Cypress Semiconductor
+* Description:    This is an event callback function to receive events from the
+*               BLE Component, which are specific to Immediate Alert Service.
+* Date:         03-23-20
+* Parameters:
+*   event:       Write Command event from the BLE component.
+*   eventParams: A structure instance of CY_BLE_GATT_HANDLE_VALUE_PAIR_T type
+*******************************************************************************/
+void IasEventHandler(uint32 event, void *eventParam)
+{
+    (void) eventParam;
+    uint8_t alert;
+
+    /* Alert Level Characteristic write event */
+    if(event == CY_BLE_EVT_IASS_WRITE_CHAR_CMD)
+    {
+        /* Read the updated Alert Level value from the GATT database */
+        Cy_BLE_IASS_GetCharacteristicValue(CY_BLE_IAS_ALERT_LEVEL, sizeof(alert), &alert);
+        alertLevel = alert;
+    }
+}
+
+
+/*******************************************************************************
+* Function:     AppCallBack
+* Author:       Cypress Semiconductor (modified by Matt Mielke)
+* Description:    This is an event callback function to receive events from the
+*               BLE Component. Used in Cy_DFU_TransportStart()
+* Date:         03-23-20
+*******************************************************************************/
+void AppCallBack(uint32_t event, void* eventParam)
+{
+    static cy_stc_ble_gap_sec_key_info_t keyInfo =
+    {
+        .localKeysFlag    = CY_BLE_GAP_SMP_INIT_ENC_KEY_DIST |
+                            CY_BLE_GAP_SMP_INIT_IRK_KEY_DIST |
+                            CY_BLE_GAP_SMP_INIT_CSRK_KEY_DIST,
+        .exchangeKeysFlag = CY_BLE_GAP_SMP_INIT_ENC_KEY_DIST |
+                            CY_BLE_GAP_SMP_INIT_IRK_KEY_DIST |
+                            CY_BLE_GAP_SMP_INIT_CSRK_KEY_DIST |
+                            CY_BLE_GAP_SMP_RESP_ENC_KEY_DIST |
+                            CY_BLE_GAP_SMP_RESP_IRK_KEY_DIST |
+                            CY_BLE_GAP_SMP_RESP_CSRK_KEY_DIST,
+    };
+
+    switch(event)
+    {
+        /**********************************************************************
+         * General events
+         *********************************************************************/
+
+        /* This event is received when the BLE stack is started */
+        case CY_BLE_EVT_STACK_ON:
+        {
+            /* Enter into discoverable mode so that remote can search it. */
+            Cy_BLE_GAPP_StartAdvertisement(CY_BLE_ADVERTISING_FAST, 0u);
+
+            Cy_BLE_GAP_GenerateKeys(&keyInfo);
+            break;
+        }
+
+        /**********************************************************************
+         * GAP events
+         *********************************************************************/
+
+        case CY_BLE_EVT_GAP_AUTH_REQ:
+        {
+            if (cy_ble_configPtr->authInfo[CY_BLE_SECURITY_CONFIGURATION_0_INDEX].security
+                == (CY_BLE_GAP_SEC_MODE_1 | CY_BLE_GAP_SEC_LEVEL_1))
+            {
+               cy_ble_configPtr->authInfo[CY_BLE_SECURITY_CONFIGURATION_0_INDEX].authErr =
+                   CY_BLE_GAP_AUTH_ERROR_PAIRING_NOT_SUPPORTED;
+            }
+
+            cy_ble_configPtr->authInfo[CY_BLE_SECURITY_CONFIGURATION_0_INDEX].bdHandle =
+               ((cy_stc_ble_gap_auth_info_t *)eventParam)->bdHandle;
+
+            Cy_BLE_GAPP_AuthReqReply(&cy_ble_configPtr->authInfo[CY_BLE_SECURITY_CONFIGURATION_0_INDEX]);
+            break;
+        }
+
+        /* This event is triggered instead of 'CY_BLE_EVT_GAP_DEVICE_CONNECTED',
+        * if Link Layer Privacy is enabled in component customizer
+        */
+        case CY_BLE_EVT_GAP_ENHANCE_CONN_COMPLETE:
+        {
+            /* sets the security keys that are to be exchanged with a peer
+             * device during key exchange stage of the authentication procedure
+             */
+            keyInfo.SecKeyParam.bdHandle =
+                (*(cy_stc_ble_gap_enhance_conn_complete_param_t *)eventParam).bdHandle;
+
+            Cy_BLE_GAP_SetSecurityKeys(&keyInfo);
+            break;
+        }
+
+        /* This event indicates security key generation complete */
+        case CY_BLE_EVT_GAP_KEYS_GEN_COMPLETE:
+        {
+            keyInfo.SecKeyParam = (*(cy_stc_ble_gap_sec_key_param_t *)eventParam);
+            Cy_BLE_GAP_SetIdAddress(&cy_ble_deviceAddress);
+            break;
+        }
+
+        /* This event is generated when disconnected from remote device or
+         * failed to establish connection
+         */
+        case CY_BLE_EVT_GAP_DEVICE_DISCONNECTED:
+        {
+            /* Enter into discoverable mode so that remote can search it. */
+            Cy_BLE_GAPP_StartAdvertisement(CY_BLE_ADVERTISING_FAST, 0u);
+
+            break;
+        }
+
+        /**********************************************************************
+         * GATT events
+         *********************************************************************/
+
+        /* This event is generated at the GAP Peripheral end after connection
+         * is completed with peer Central device
+         */
+        case CY_BLE_EVT_GATT_CONNECT_IND:
+        {
+            appConnHandle = *(cy_stc_ble_conn_handle_t *)eventParam;
+            break;
+        }
+
+        default:
+        {
+            break;
+        }
+    }
 }
 
 /* [] END OF FILE */
