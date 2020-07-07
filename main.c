@@ -150,7 +150,7 @@ int main(void)
     cy_status status;
     cy_rslt_t result;
 
-    /* Define the .cy_app_signature section */
+    /* This section holds signature data for application verification */
     CY_SECTION(".cy_app_signature") __USED static const uint32_t cy_dfu_appSignature[1];
 
     /* Initialize the device and board peripherals */
